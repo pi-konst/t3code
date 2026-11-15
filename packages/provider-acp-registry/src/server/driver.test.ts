@@ -1048,7 +1048,7 @@ it.layer(driverLayer, { excludeTestServices: true })("AcpRegistryDriver", (it) =
         });
         expect(kimiRequests).toEqual([]);
 
-        // Kimi signs in; the next provider refresh reads the new token.
+        // Usage refresh must recover too; the core normally skips unavailable providers.
         const nowSeconds = Math.floor((yield* Clock.currentTimeMillis) / 1000);
         yield* fileSystem.makeDirectory(path.dirname(tokenPath), { recursive: true });
         const token = { access_token: "access-1", refresh_token: "refresh-1" };
@@ -1056,7 +1056,8 @@ it.layer(driverLayer, { excludeTestServices: true })("AcpRegistryDriver", (it) =
           tokenPath,
           JSON.stringify({ ...token, expires_at: nowSeconds + 900 }),
         );
-        const signedIn = yield* instance.snapshot.refresh;
+        yield* instance.snapshot.refreshUsage ?? Effect.void;
+        const signedIn = yield* instance.snapshot.getSnapshot;
         expect(signedIn.usageLimits?.unavailable).toBeUndefined();
         expect(signedIn.usageLimits?.windows.map((window) => window.usedPercent)).toEqual([25]);
         expect(kimiRequests.every((request) => request.authorization === "Bearer access-1")).toBe(

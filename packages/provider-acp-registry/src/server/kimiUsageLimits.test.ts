@@ -1,3 +1,5 @@
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- A loopback fixture verifies redirect handling by the real fetch client.
+import * as NodeHttp from "node:http";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
@@ -220,16 +222,64 @@ describe("Kimi subscription limits", () => {
           usedPercent: 32.52,
           resetsAt: "2026-12-07T00:00:00.000Z",
         },
-        {
-          id: "limit_month_code",
-          label: "Monthly · Kimi Code",
-          kind: "monthly",
-          usedPercent: 6.05,
-          resetsAt: "2026-12-07T00:00:00.000Z",
-        },
       ]);
     }),
   );
+
+  it.effect(
+    "uses counted quotas as a fallback without inventing windows or accepting invalid ratios",
+    () =>
+      Effect.gen(function* () {
+        const row = (duration: number, timeUnit: string, used: string, limit: string) => ({
+          window: { duration, timeUnit },
+          detail: { used, limit, resetTime: "2026-12-07T00:00:00Z" },
+        });
+        const windows = yield* kimiUsageWindows({
+          limits: [
+            row(5, "TIME_UNIT_HOUR", "25", "100"),
+            row(1, "TIME_UNIT_WEEK", "40", "100"),
+            row(1, "TIME_UNIT_DAY", "10", "100"),
+            row(30, "TIME_UNIT_DAY", "75", "100"),
+            row(2, "TIME_UNIT_HOUR", "-1", "100"),
+            row(3, "TIME_UNIT_HOUR", "0", "0"),
+            { window: { duration: 300, timeUnit: "TIME_UNIT_MINUTE" } },
+          ],
+          usages: {
+            limit_5h: { used_ratio: 0.5 },
+            limit_7d: { used_ratio: "" },
+            limit_month_code: { used_ratio: 0.99 },
+          },
+        });
+        expect(windows.map(({ id, kind, usedPercent }) => ({ id, kind, usedPercent }))).toEqual([
+          { id: "limit_5h", kind: "session", usedPercent: 50 },
+          { id: "limit_7d", kind: "weekly", usedPercent: 40 },
+          { id: "kimi-window-1440", kind: "other", usedPercent: 10 },
+          { id: "limit_month_total", kind: "monthly", usedPercent: 75 },
+        ]);
+        expect(
+          yield* kimiUsageWindows({
+            usages: {
+              limit_5h: { used_ratio: "  " },
+              limit_7d: { used_ratio: -0.5 },
+              limit_month_total: { used_ratio: "Infinity" },
+            },
+          }),
+        ).toEqual([]);
+      }),
+  );
+
+  it("reads TOML nested and inline tables and rejects malformed configuration", () => {
+    expect(
+      readKimiManagedProviderConfig(
+        `providers = { "managed:kimi-code" = { base_url = "https://api.kimi.ai/coding/v1", oauth = { storage = "file", oauth_host = "https://auth.kimi.ai" } } }`,
+      ),
+    ).toMatchObject({
+      hasOAuth: true,
+      baseUrl: "https://api.kimi.ai/coding/v1",
+      oauthHost: "https://auth.kimi.ai",
+    });
+    expect(() => readKimiManagedProviderConfig('[providers."managed:kimi-code"')).toThrow();
+  });
 
   it.effect("derives the CLI's credential slot for each environment", () =>
     Effect.gen(function* () {
@@ -295,11 +345,7 @@ describe("Kimi subscription limits", () => {
       const before = yield* listHome;
       const limits = yield* probe;
       expect(limits.unavailable).toBeUndefined();
-      expect(limits.windows.map((window) => window.id)).toEqual([
-        "limit_5h",
-        "limit_month_code",
-        "limit_month_total",
-      ]);
+      expect(limits.windows.map((window) => window.id)).toEqual(["limit_5h", "limit_month_total"]);
       expect(limits.credentialFingerprint).toMatch(/^[0-9a-f]{64}$/);
       expect(requests.map((request) => `${request.method} ${request.url}`).toSorted()).toEqual([
         "GET https://api.kimi.ai/coding/v1/me",
@@ -375,7 +421,7 @@ describe("Kimi subscription limits", () => {
       yield* fs.writeFileString(defaultSlot, JSON.stringify(validToken));
       const recovered = yield* probe;
       expect(recovered.unavailable).toBeUndefined();
-      expect(recovered.windows).toHaveLength(3);
+      expect(recovered.windows).toHaveLength(2);
     }).pipe(Effect.scoped, Effect.provide(layer)),
   );
 
@@ -400,7 +446,7 @@ describe("Kimi subscription limits", () => {
       const fs = yield* FileSystem.FileSystem;
       const offline = yield* fixture({ token: validToken, respond: () => "fail" });
       expect((yield* offline.probe).unavailable).toEqual({
-        reason: "probeFailed",
+        reason: "unsupported",
         message: "Could not read Kimi limits. Refresh provider status to retry.",
       });
       expect(JSON.parse(yield* fs.readFileString(offline.tokenPath))).toEqual(validToken);
@@ -410,7 +456,7 @@ describe("Kimi subscription limits", () => {
         token: validToken,
         respond: () => ({ status: 302 }),
       });
-      expect((yield* redirected.probe).unavailable?.reason).toBe("probeFailed");
+      expect((yield* redirected.probe).unavailable?.reason).toBe("unsupported");
       expect(redirected.requests.map((request) => request.url).toSorted()).toEqual([
         "https://api.kimi.ai/coding/v1/me",
         "https://api.kimi.ai/coding/v1/usages",
@@ -456,9 +502,57 @@ describe("Kimi subscription limits", () => {
         allowLoopbackHttp: true,
       });
       yield* signIn(local.credentialsDir, loopback);
-      expect((yield* local.probe).windows).toHaveLength(3);
+      expect((yield* local.probe).windows).toHaveLength(2);
       expect(local.requests.map((request) => request.url)).toContain(`${loopback}/usages`);
     }).pipe(Effect.scoped, Effect.provide(layer)),
+  );
+
+  it.live("does not follow redirects with a real fetch client", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const received: string[] = [];
+      const server = NodeHttp.createServer((request, response) => {
+        received.push(request.url ?? "");
+        if (request.url === "/coding/v1/usages") {
+          response.writeHead(302, { Location: "/capture" });
+          response.end();
+        } else {
+          response.writeHead(200, { "Content-Type": "application/json" });
+          response.end(JSON.stringify({ user_id: "fixture-user" }));
+        }
+      });
+      yield* Effect.acquireRelease(
+        Effect.promise(
+          () =>
+            new Promise<void>((resolve, reject) => {
+              server.once("error", reject);
+              server.listen(0, "127.0.0.1", resolve);
+            }),
+        ),
+        () => Effect.promise(() => new Promise<void>((resolve) => server.close(() => resolve()))),
+      );
+      const address = server.address();
+      if (address === null || typeof address === "string") throw new Error("No fixture port");
+      const baseUrl = `http://127.0.0.1:${address.port}/coding/v1`;
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "kimi-fetch-" });
+      const { slot } = yield* resolveKimiCodeAuthTarget(
+        { hasOAuth: false },
+        { KIMI_CODE_BASE_URL: baseUrl },
+      );
+      yield* fs.makeDirectory(path.join(root, "credentials"));
+      const tokenPath = path.join(root, "credentials", `${slot}.json`);
+      const original = JSON.stringify({ access_token: "fixture-only", expires_at: 4102444800 });
+      yield* fs.writeFileString(tokenPath, original);
+      const probe = yield* makeKimiUsageProbe({
+        candidates: ["kimi-code"],
+        environment: { KIMI_CODE_HOME: root, KIMI_CODE_BASE_URL: baseUrl },
+        allowLoopbackHttp: true,
+      });
+      expect((yield* probe).unavailable).toBeDefined();
+      expect(received.toSorted()).toEqual(["/coding/v1/me", "/coding/v1/usages"]);
+      expect(yield* fs.readFileString(tokenPath)).toBe(original);
+    }).pipe(Effect.scoped, Effect.provide(Layer.merge(layer, FetchHttpClient.layer))),
   );
 
   it.effect("sends the legacy CLI's token only to Kimi's default endpoint", () =>
@@ -481,11 +575,39 @@ describe("Kimi subscription limits", () => {
         candidates: ["kimi-legacy"],
         environment: { KIMI_CODE_BASE_URL: "https://api.kimi.com/coding/v1/" },
       });
-      expect((yield* explicitDefault.probe).windows).toHaveLength(3);
+      expect((yield* explicitDefault.probe).windows).toHaveLength(2);
       expect(explicitDefault.requests.map((request) => request.url)).toContain(
         "https://api.kimi.com/coding/v1/usages",
       );
     }).pipe(Effect.scoped, Effect.provide(layer)),
+  );
+
+  it.effect(
+    "does not substitute legacy credentials for a configured modern account or API key",
+    () =>
+      Effect.gen(function* () {
+        for (const config of [
+          GLOBAL_CONFIG,
+          GLOBAL_CONFIG.replace('api_key = ""', 'api_key = "explicit-api-key"'),
+          GLOBAL_CONFIG.replace('api_key = ""', 'api_key_env = "MY_KIMI_KEY"'),
+          '[providers."managed:kimi-code"',
+        ]) {
+          const current = yield* fixture({
+            config,
+            legacyToken: validToken,
+            candidates: ["kimi-code", "kimi-legacy"],
+          });
+          expect((yield* current.probe).windows).toEqual([]);
+          expect(current.requests).toEqual([]);
+        }
+        const expired = yield* fixture({
+          token: expiredToken,
+          legacyToken: validToken,
+          candidates: ["kimi-code", "kimi-legacy"],
+        });
+        expect((yield* expired.probe).unavailable?.message).toBe(EXPIRED_MESSAGE);
+        expect(expired.requests).toEqual([]);
+      }).pipe(Effect.scoped, Effect.provide(layer)),
   );
 
   it.effect("asks for a sign-in when no Kimi generation has credentials", () =>
@@ -511,7 +633,7 @@ describe("Kimi subscription limits", () => {
         candidates: ["kimi-code", "kimi-legacy"],
       });
       const limits = yield* fresh.probe;
-      expect(limits.windows).toHaveLength(3);
+      expect(limits.windows).toHaveLength(2);
       expect(fresh.requests.map((request) => request.url)).toContain(
         "https://api.kimi.com/coding/v1/usages",
       );

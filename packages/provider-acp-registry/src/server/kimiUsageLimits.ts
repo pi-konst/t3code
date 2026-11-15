@@ -20,6 +20,8 @@ import * as HttpClient from "effect/http/HttpClient";
 import * as HttpClientRequest from "effect/http/HttpClientRequest";
 import * as HttpClientResponse from "effect/http/HttpClientResponse";
 
+import * as Toml from "smol-toml";
+
 import type { AcpRegistrySettings } from "../settings.ts";
 
 // Mirrors Kimi Code 2.x and the archived kimi-cli 1.x. Their refresh tokens are single-use,
@@ -43,7 +45,7 @@ export function kimiCliCandidates(
     return undefined;
   }
   // Package launchers such as `npx @moonshot-ai/kimi-code acp` or `uvx kimi-cli acp`.
-  if (settings.commandArgs.some((arg) => arg.startsWith("@moonshot-ai/kimi-code"))) {
+  if (settings.commandArgs.some((arg) => /^@moonshot-ai\/kimi-code(?:@|$)/.test(arg))) {
     return ["kimi-code"];
   }
   if (settings.commandArgs.some((arg) => /^kimi-cli(?:[@=<>~]|$)/.test(arg))) {
@@ -62,16 +64,20 @@ const QuotaEntry = Schema.Struct({
   used_ratio: Schema.optional(Schema.Union([Schema.Number, Schema.String])),
   reset_time: Schema.optional(Schema.NullOr(Schema.String)),
 });
-const UsagePayload = Schema.Struct({
-  usages: Schema.optional(
-    Schema.Struct({
-      limit_5h: Schema.optional(Schema.NullOr(QuotaEntry)),
-      limit_7d: Schema.optional(Schema.NullOr(QuotaEntry)),
-      limit_month_total: Schema.optional(Schema.NullOr(QuotaEntry)),
-      limit_month_code: Schema.optional(Schema.NullOr(QuotaEntry)),
-    }),
-  ),
+const CountedQuota = Schema.Struct({
+  window: Schema.Struct({ duration: Schema.Number, timeUnit: Schema.String }),
+  detail: Schema.Struct({
+    used: Schema.Union([Schema.Number, Schema.String]),
+    limit: Schema.Union([Schema.Number, Schema.String]),
+    resetTime: Schema.optional(Schema.String),
+  }),
 });
+const UsagePayload = Schema.Struct({
+  usages: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
+  limits: Schema.optional(Schema.Array(Schema.Unknown)),
+});
+const decodeQuota = Schema.decodeUnknownOption(QuotaEntry);
+const decodeCountedQuota = Schema.decodeUnknownOption(CountedQuota);
 const UserInfo = Schema.Struct({ user_id: Schema.NonEmptyString });
 /** Only what the probe reads; the refresh token is never decoded. */
 const TokenFile = Schema.Struct({
@@ -87,31 +93,85 @@ const WINDOWS = [
   { key: "limit_5h", label: "5-hour", kind: "session", windowDurationMins: 5 * 60 },
   { key: "limit_7d", label: "Weekly", kind: "weekly", windowDurationMins: 7 * 24 * 60 },
   { key: "limit_month_total", label: "Monthly", kind: "monthly" },
-  { key: "limit_month_code", label: "Monthly · Kimi Code", kind: "monthly" },
 ] as const;
 
-/** Windows from a `GET <base_url>/usages` answer. Omitted quotas stay omitted. */
+function nonnegativeNumber(value: unknown): number | undefined {
+  if (typeof value !== "number" && typeof value !== "string") return undefined;
+  if (typeof value === "string" && value.trim() === "") return undefined;
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? number : undefined;
+}
+
+function resetTimestamp(value: string | null | undefined) {
+  const instant = value ? DateTime.make(value) : Option.none();
+  return Option.isSome(instant) ? { resetsAt: DateTime.formatIso(instant.value) } : {};
+}
+
+const MINUTES_PER_UNIT: Readonly<Record<string, number>> = {
+  TIME_UNIT_MINUTE: 1,
+  TIME_UNIT_HOUR: 60,
+  TIME_UNIT_DAY: 1440,
+  TIME_UNIT_WEEK: 10080,
+};
+
+/** Kimi Code 2.5.1 managed-usage/usage-format: month_code is a breakdown, not another quota. */
 export const kimiUsageWindows = (payload: unknown) =>
   decodeUsagePayload(payload).pipe(
-    Effect.map(({ usages }) => {
-      const windows: ServerProviderUsageWindow[] = [];
+    Effect.map(({ usages, limits }) => {
+      const windows = new Map<string, ServerProviderUsageWindow>();
       for (const window of WINDOWS) {
-        const entry = usages?.[window.key];
-        const ratio = Number(entry?.used_ratio);
-        if (entry?.used_ratio === undefined || !Number.isFinite(ratio)) continue;
-        const reset = entry.reset_time ? DateTime.make(entry.reset_time) : Option.none();
-        windows.push({
+        const decoded = decodeQuota(usages?.[window.key]);
+        if (Option.isNone(decoded)) continue;
+        const entry = decoded.value;
+        const ratio = nonnegativeNumber(entry.used_ratio);
+        if (ratio === undefined) continue;
+        windows.set(window.key, {
           id: window.key,
           label: window.label,
           kind: window.kind,
           usedPercent: clampPercent(Math.round(ratio * 1e6) / 1e4),
-          ...(Option.isSome(reset) ? { resetsAt: DateTime.formatIso(reset.value) } : {}),
+          ...resetTimestamp(entry.reset_time),
           ...("windowDurationMins" in window
             ? { windowDurationMins: window.windowDurationMins }
             : {}),
         });
       }
-      return windows;
+      // Count-based responses are a fallback; preserve the CLI's named ratios when both exist.
+      for (const raw of limits ?? []) {
+        const decoded = decodeCountedQuota(raw);
+        if (Option.isNone(decoded)) continue;
+        const { window, detail } = decoded.value;
+        const used = nonnegativeNumber(detail.used);
+        const limit = nonnegativeNumber(detail.limit);
+        const minutes = window.duration * (MINUTES_PER_UNIT[window.timeUnit] ?? 0);
+        if (
+          used === undefined ||
+          limit === undefined ||
+          limit <= 0 ||
+          !Number.isFinite(minutes) ||
+          minutes <= 0
+        )
+          continue;
+        const known =
+          minutes === 300
+            ? WINDOWS[0]
+            : minutes === 10080
+              ? WINDOWS[1]
+              : minutes === 43200
+                ? WINDOWS[2]
+                : undefined;
+        const id = known?.key ?? `kimi-window-${minutes}`;
+        if (windows.has(id)) continue;
+        windows.set(id, {
+          id,
+          label: known?.label ?? `${minutes}-minute`,
+          kind: known?.kind ?? "other",
+          usedPercent: clampPercent(Math.round((used / limit) * 1e6) / 1e4),
+          windowDurationMins: minutes,
+          ...resetTimestamp(detail.resetTime),
+        });
+      }
+      return [...windows.values()];
     }),
   );
 
@@ -120,72 +180,32 @@ export interface KimiManagedProviderConfig {
   readonly oauthHost?: string;
   readonly oauthStorage?: string;
   readonly hasOAuth: boolean;
+  readonly hasApiKey?: boolean;
 }
 
-function tomlString(raw: string): string | undefined {
-  const value = raw.trim();
-  const basic = /^"((?:[^"\\]|\\.)*)"/.exec(value);
-  if (basic) {
-    try {
-      return JSON.parse(`"${basic[1]}"`) as string;
-    } catch {
-      return undefined;
-    }
-  }
-  return /^'([^']*)'/.exec(value)?.[1];
+function record(value: unknown): Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
 }
 
-function tomlInlineTable(raw: string): Map<string, string> {
-  const fields = new Map<string, string>();
-  const body = /^\{(.*)\}\s*(?:#.*)?$/.exec(raw.trim())?.[1] ?? "";
-  for (const match of body.matchAll(/([A-Za-z0-9_-]+)\s*=\s*("(?:[^"\\]|\\.)*"|'[^']*')/g)) {
-    const value = tomlString(match[2] ?? "");
-    if (match[1] && value !== undefined) fields.set(match[1], value);
-  }
-  return fields;
+function text(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value : undefined;
 }
 
-const PROVIDER_TABLE = /^\[\s*providers\s*\.\s*(?:"managed:kimi-code"|'managed:kimi-code')\s*\]/;
-const OAUTH_TABLE =
-  /^\[\s*providers\s*\.\s*(?:"managed:kimi-code"|'managed:kimi-code')\s*\.\s*oauth\s*\]/;
-
-/**
- * Reads the managed Kimi Code provider from `config.toml`. This covers the flat
- * tables and inline `oauth` table the CLI writes, not arbitrary TOML.
- */
-export function readKimiManagedProviderConfig(text: string): KimiManagedProviderConfig {
-  let section: "provider" | "oauth" | undefined;
-  let baseUrl: string | undefined;
-  let oauthHost: string | undefined;
-  let oauthStorage: string | undefined;
-  let hasOAuth = false;
-  for (const rawLine of text.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (line.startsWith("[")) {
-      section = OAUTH_TABLE.test(line)
-        ? "oauth"
-        : PROVIDER_TABLE.test(line)
-          ? "provider"
-          : undefined;
-      if (section === "oauth") hasOAuth = true;
-      continue;
-    }
-    if (section === undefined) continue;
-    const assignment = /^([A-Za-z0-9_-]+)\s*=\s*(.*)$/.exec(line);
-    if (!assignment) continue;
-    const [, key, value = ""] = assignment;
-    if (section === "provider" && key === "base_url") baseUrl = tomlString(value) ?? baseUrl;
-    if (section === "provider" && key === "oauth") {
-      hasOAuth = true;
-      const table = tomlInlineTable(value);
-      oauthHost = table.get("oauth_host") ?? oauthHost;
-      oauthStorage = table.get("storage") ?? oauthStorage;
-    }
-    if (section === "oauth" && key === "oauth_host") oauthHost = tomlString(value) ?? oauthHost;
-    if (section === "oauth" && key === "storage") oauthStorage = tomlString(value) ?? oauthStorage;
-  }
+export function readKimiManagedProviderConfig(source: string): KimiManagedProviderConfig {
+  const root = Toml.parse(source);
+  const provider = record(record(root.providers)["managed:kimi-code"]);
+  const oauth = record(provider.oauth);
+  const baseUrl = text(provider.base_url);
+  const oauthHost = text(oauth.oauth_host);
+  const oauthStorage = text(oauth.storage);
+  const hasApiKey = Boolean(
+    text(provider.api_key) || text(provider.api_key_env) || text(record(provider.env).KIMI_API_KEY),
+  );
   return {
-    hasOAuth,
+    hasOAuth: provider.oauth !== undefined,
+    ...(hasApiKey ? { hasApiKey } : {}),
     ...(baseUrl ? { baseUrl } : {}),
     ...(oauthHost ? { oauthHost } : {}),
     ...(oauthStorage ? { oauthStorage } : {}),
@@ -262,11 +282,10 @@ export function kimiApiBaseUrl(
 }
 
 type Unavailable = {
-  readonly unavailable: "unsupported" | "probeFailed";
+  readonly unavailable: "unsupported";
   readonly message: string;
 };
 const unsupported = (message: string): Unavailable => ({ unavailable: "unsupported", message });
-const probeFailed = (message: string): Unavailable => ({ unavailable: "probeFailed", message });
 
 // A sign-in problem is "unsupported", never "probeFailed": the provider keeps the last good
 // reading over a failed probe, which would show limits T3 can no longer confirm as current.
@@ -280,13 +299,16 @@ const REJECTED = unsupported(
 const NO_EXPIRY = unsupported(
   "Kimi's stored sign-in has no expiry time. Use Kimi once, then refresh provider status.",
 );
+const INVALID_CONFIG = unsupported(
+  "Could not parse Kimi's config.toml. Fix it and refresh provider status.",
+);
 const FILE_STORAGE = unsupported("Kimi limits need Kimi Code's file-based sign-in.");
 const INSECURE_ENDPOINT = unsupported("Kimi limits are read only from an HTTPS Kimi endpoint.");
 const LEGACY_CUSTOM_ENDPOINT = unsupported(
   "Limits for the legacy Kimi CLI are read only from Kimi's default endpoint.",
 );
 const NO_LIMITS = unsupported("This Kimi endpoint does not report plan limits.");
-const UNREADABLE = probeFailed("Could not read Kimi limits. Refresh provider status to retry.");
+const UNREADABLE = unsupported("Could not read Kimi limits. Refresh provider status to retry.");
 
 const expiredSignIn = (expiresAt: number, now: number) => {
   const at = Option.match(DateTime.make(expiresAt * 1000), {
@@ -361,9 +383,20 @@ export const makeKimiUsageProbe = Effect.fn("makeKimiUsageProbe")(function* (
 
   const kimiCodeCredentials = Effect.fn("KimiUsage.kimiCodeCredentials")(function* () {
     const kimiHome = env.KIMI_CODE_HOME || path.join(home, ".kimi-code");
-    const config = readKimiManagedProviderConfig(
-      Option.getOrElse(yield* readOptional(path.join(kimiHome, "config.toml")), () => ""),
+    if (!path.isAbsolute(kimiHome))
+      return unsupported("Set KIMI_CODE_HOME to an absolute path to read Kimi limits.");
+    const source = Option.getOrElse(
+      yield* readOptional(path.join(kimiHome, "config.toml")),
+      () => "",
     );
+    const parsed = yield* Effect.try({
+      try: () => readKimiManagedProviderConfig(source),
+      catch: () => INVALID_CONFIG,
+    }).pipe(Effect.option);
+    if (Option.isNone(parsed)) return INVALID_CONFIG;
+    const config = parsed.value;
+    if (config.hasApiKey)
+      return unsupported("Kimi API-key configurations do not report subscription limits.");
     if (config.oauthStorage !== undefined && config.oauthStorage !== "file") return FILE_STORAGE;
     const target = yield* resolveKimiCodeAuthTarget(config, env).pipe(
       Effect.provideService(Digest.Digest, digest),
@@ -381,6 +414,8 @@ export const makeKimiUsageProbe = Effect.fn("makeKimiUsageProbe")(function* (
   /** The 1.x CLI's single credential belongs to Kimi's own endpoint, so it is never sent elsewhere. */
   const legacyCredentials = Effect.fn("KimiUsage.legacyCredentials")(function* () {
     const shareDir = env.KIMI_SHARE_DIR || path.join(home, ".kimi");
+    if (!path.isAbsolute(shareDir))
+      return unsupported("Set KIMI_SHARE_DIR to an absolute path to read Kimi limits.");
     const stored = yield* readToken(path.join(shareDir, "credentials", "kimi-code.json"));
     if (Option.isNone(stored)) return SIGN_IN;
     const accessToken = yield* currentAccessToken(stored.value);
@@ -398,8 +433,9 @@ export const makeKimiUsageProbe = Effect.fn("makeKimiUsageProbe")(function* (
       const result =
         cli === "kimi-code" ? yield* kimiCodeCredentials() : yield* legacyCredentials();
       if ("accessToken" in result) return result;
-      // Report the first real problem; a generation that was never signed in says less.
-      if (reported === undefined || reported === SIGN_IN) reported = result;
+      // A configured modern account must not fall back to an unrelated legacy sign-in.
+      if (result !== SIGN_IN) return result;
+      reported = result;
     }
     return reported ?? SIGN_IN;
   });
@@ -430,7 +466,12 @@ export const makeKimiUsageProbe = Effect.fn("makeKimiUsageProbe")(function* (
           Effect.flatMap((response) => response.json),
           Effect.flatMap(decodeUserInfo),
           Effect.flatMap((info) =>
-            digest.digest(Digest.sha256, new TextEncoder().encode(`kimi-code\0${info.user_id}`)),
+            digest.digest(
+              Digest.sha256,
+              new TextEncoder().encode(
+                `kimi-code\0${new URL(resolved.baseUrl).origin}\0${info.user_id}`,
+              ),
+            ),
           ),
           Effect.map(Hex.encode),
           Effect.option,
@@ -451,7 +492,7 @@ export const makeKimiUsageProbe = Effect.fn("makeKimiUsageProbe")(function* (
     if (windows.length === 0) {
       return makeUnavailableUsageLimits({
         checkedAt,
-        reason: "probeFailed",
+        reason: "unsupported",
         message: "Kimi did not return usable quota information.",
       });
     }

@@ -1025,6 +1025,10 @@ export const AcpRegistryDriver: ProviderDriver<AcpRegistrySettings, AcpRegistryD
       snapshot: {
         ...snapshot,
         refresh: snapshot.refresh.pipe(Effect.tap(() => controller.refreshMethods ?? Effect.void)),
+        // Kimi can recover after its CLI renews sign-in, even from an unavailable snapshot.
+        ...(checkUsageLimits === undefined
+          ? {}
+          : { refreshUsage: snapshot.refresh.pipe(Effect.asVoid) }),
       },
       invalidateCaches: (Option.isSome(runtimeCoordinator)
         ? runtimeCoordinator.value.clearLiveConfiguration(instanceId)

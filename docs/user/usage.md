@@ -174,7 +174,9 @@ command, once Kimi Code is signed in on that environment. T3 reads Kimi's own si
 `KIMI_CODE_HOME`, `KIMI_CODE_BASE_URL`, or `KIMI_CODE_OAUTH_HOST` set in the instance's
 **Environment variables**, but never renews or changes it. Kimi renews its sign-in while you use
 it; when the stored sign-in has expired, the limits say when it expired and stay empty until you
-use Kimi once and refresh provider status. T3 sends Kimi's token only over HTTPS, and the legacy
+use Kimi once and refresh Limits or provider status. Failed reads clear the displayed quotas instead
+of retaining unverified numbers. The monthly allowance includes Kimi Code usage; its breakdown is
+not a separate limit. T3 sends Kimi's token only over HTTPS, and the legacy
 `kimi` registry agent's token only to Kimi's default endpoint. Kimi API keys do not report limits.
 
 API-key accounts may not report subscription limits. This also applies to Claude connections
