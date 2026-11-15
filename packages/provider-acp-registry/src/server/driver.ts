@@ -22,6 +22,9 @@ import * as Ref from "effect/Ref";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
+import * as FileSystem from "effect/FileSystem";
+import * as HttpClient from "effect/http/HttpClient";
+import * as Path from "effect/Path";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
@@ -62,6 +65,7 @@ import * as AcpRegistrySupport from "./AcpRegistrySupport.ts";
 import * as AcpRegistryRuntimeCoordinator from "./AcpRegistryRuntimeCoordinator.ts";
 import * as AcpRegistryAuth from "./auth.ts";
 import * as AcpRegistryAuthenticationState from "./authenticationState.ts";
+import { kimiCliCandidates, makeKimiUsageProbe } from "./kimiUsageLimits.ts";
 
 const DRIVER_KIND = ProviderDriverKind.make("acpRegistry");
 const decodeSettings = Schema.decodeSync(AcpRegistrySettings);
@@ -600,6 +604,7 @@ export const checkAcpRegistryProviderReadiness = Effect.fn(
 export type AcpRegistryDriverEnv =
   | AcpRegistryAdapterV2DriverEnv
   | Digest.Digest
+  | HttpClient.HttpClient
   | ProviderHost.ProviderHost;
 
 export const AcpRegistryDriver: ProviderDriver<AcpRegistrySettings, AcpRegistryDriverEnv> = {
@@ -746,6 +751,30 @@ export const AcpRegistryDriver: ProviderDriver<AcpRegistrySettings, AcpRegistryD
       ),
       Effect.flatMap(withLiveRuntimeState),
     );
+    // Kimi agents expose their plan limits only through the CLI's own OAuth credentials.
+    const kimiCandidates = kimiCliCandidates(effectiveConfig);
+    const checkUsageLimits =
+      kimiCandidates === undefined
+        ? undefined
+        : yield* makeKimiUsageProbe({
+            candidates: kimiCandidates,
+            environment: processEnvironment,
+          }).pipe(
+            Effect.provideService(FileSystem.FileSystem, yield* FileSystem.FileSystem),
+            Effect.provideService(Path.Path, yield* Path.Path),
+            Effect.provideService(Digest.Digest, yield* Digest.Digest),
+            Effect.provideService(HttpClient.HttpClient, yield* HttpClient.HttpClient),
+          );
+    const checkProviderWithUsage =
+      checkUsageLimits === undefined
+        ? checkProvider
+        : checkProvider.pipe(
+            Effect.filterOrElse(
+              (provider) => !provider.enabled || !provider.installed,
+              (provider) =>
+                checkUsageLimits.pipe(Effect.map((usageLimits) => ({ ...provider, usageLimits }))),
+            ),
+          );
     const enrichProvider = checkAcpRegistryProviderStatus(
       {
         ...readinessInput,
@@ -814,8 +843,10 @@ export const AcpRegistryDriver: ProviderDriver<AcpRegistrySettings, AcpRegistryD
       getSettings: snapshotSettings.getSettings,
       streamSettings: snapshotSettings.streamSettings,
       haveSettingsChanged: haveProviderSnapshotSettingsChanged,
+      // The quota read is network I/O, so it waits for the first post-startup check.
       initialSnapshot: () => checkProvider,
-      checkProvider,
+      checkProvider: checkProviderWithUsage,
+      ...(checkUsageLimits === undefined ? {} : { checkUsageLimits }),
       enrichSnapshot: Effect.fn("enrichSnapshot")(function ({
         snapshot,
         getSnapshot,

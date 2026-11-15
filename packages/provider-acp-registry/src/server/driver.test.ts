@@ -11,6 +11,7 @@ import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEve
 import * as TestProviderHost from "@t3tools/provider-testing/TestProviderHost";
 import { AcpRegistrySettings } from "../settings.ts";
 import { describe, expect, it } from "@effect/vitest";
+import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
@@ -19,6 +20,8 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import * as HttpClient from "effect/http/HttpClient";
+import * as HttpClientResponse from "effect/http/HttpClientResponse";
 
 import * as AcpRegistryRuntimeCoordinator from "./AcpRegistryRuntimeCoordinator.ts";
 import * as AcpRegistrySupport from "./AcpRegistrySupport.ts";
@@ -846,6 +849,25 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 });
 `;
 
+// Kimi limit reads hit this stub, never the network; it records each bearer it receives.
+const kimiRequests: Array<{ readonly url: string; readonly authorization?: string }> = [];
+const kimiHttpClient = HttpClient.make((request) =>
+  Effect.sync(() => {
+    kimiRequests.push({
+      url: request.url,
+      ...(request.headers.authorization === undefined
+        ? {}
+        : { authorization: request.headers.authorization }),
+    });
+    return HttpClientResponse.fromWeb(
+      request,
+      request.url.endsWith("/me")
+        ? Response.json({ user_id: "user-1" })
+        : Response.json({ usages: { limit_5h: { used_ratio: 0.25 } } }),
+    );
+  }),
+);
+
 const driverLayer = TestProviderHost.layer({ runBackgroundWork: false }).pipe(
   Layer.provideMerge(AcpRegistryRuntimeCoordinator.layer),
   Layer.provideMerge(IdAllocator.layer),
@@ -856,7 +878,13 @@ const driverLayer = TestProviderHost.layer({ runBackgroundWork: false }).pipe(
       ProviderEventLoggers.NoOpProviderEventLoggers,
     ),
   ),
-  Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+  Layer.provideMerge(
+    Layer.mergeAll(
+      NodeServices.layer,
+      NodeCrypto.layer,
+      Layer.succeed(HttpClient.HttpClient, kimiHttpClient),
+    ),
+  ),
 );
 
 it.layer(driverLayer, { excludeTestServices: true })("AcpRegistryDriver", (it) => {
@@ -975,6 +1003,81 @@ it.layer(driverLayer, { excludeTestServices: true })("AcpRegistryDriver", (it) =
       const next = yield* Fiber.join(nextPublished);
       expect(Option.map(next, (snapshot) => snapshot.version)).toEqual(Option.some("1.5.9"));
     }),
+  );
+
+  it.effect(
+    "reads Kimi Code limits from the instance's own Kimi home and recovers after sign-in",
+    () =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const directory = yield* fileSystem.makeTempDirectoryScoped({ prefix: "acp-driver-" });
+        const agentPath = path.join(directory, "agent.mjs");
+        const modelsPath = path.join(directory, "models.json");
+        const kimiHome = path.join(directory, "kimi");
+        const tokenPath = path.join(kimiHome, "credentials", "kimi-code.json");
+        yield* fileSystem.writeFileString(agentPath, fakeAgentSource);
+        yield* fileSystem.writeFileString(modelsPath, JSON.stringify(["model-a"]));
+        kimiRequests.length = 0;
+
+        const instance = yield* AcpRegistryDriver.create({
+          instanceId: identity.instanceId,
+          displayName: identity.displayName,
+          enabled: true,
+          environment: [{ name: "KIMI_CODE_HOME", value: kimiHome, sensitive: false }],
+          config: decodeSettings({ agentId: "kimi-code" }),
+        }).pipe(
+          Effect.provideService(AcpRegistrySupport.AcpRegistryCatalog, {
+            ...catalogWithInspection({
+              status: "ready",
+              agentId: "kimi-code",
+              version: "2.6.2",
+              distribution: "npx",
+            }),
+            resolve: () =>
+              Effect.succeed({
+                distribution: "npx" as const,
+                spawn: { command: process.execPath, args: [agentPath, modelsPath] },
+              }),
+          }),
+        );
+        const signedOut = yield* instance.snapshot.refresh;
+        expect(signedOut.usageLimits?.unavailable).toEqual({
+          reason: "unsupported",
+          message: "Sign in to Kimi Code to see its limits.",
+        });
+        expect(kimiRequests).toEqual([]);
+
+        // Kimi signs in; the next provider refresh reads the new token.
+        const nowSeconds = Math.floor((yield* Clock.currentTimeMillis) / 1000);
+        yield* fileSystem.makeDirectory(path.dirname(tokenPath), { recursive: true });
+        const token = { access_token: "access-1", refresh_token: "refresh-1" };
+        yield* fileSystem.writeFileString(
+          tokenPath,
+          JSON.stringify({ ...token, expires_at: nowSeconds + 900 }),
+        );
+        const signedIn = yield* instance.snapshot.refresh;
+        expect(signedIn.usageLimits?.unavailable).toBeUndefined();
+        expect(signedIn.usageLimits?.windows.map((window) => window.usedPercent)).toEqual([25]);
+        expect(kimiRequests.every((request) => request.authorization === "Bearer access-1")).toBe(
+          true,
+        );
+
+        // Once the token lapses, the earlier reading is dropped instead of shown as current.
+        const expired = JSON.stringify({ ...token, expires_at: nowSeconds - 60 });
+        yield* fileSystem.writeFileString(tokenPath, expired);
+        kimiRequests.length = 0;
+        const lapsed = yield* instance.snapshot.refresh;
+        expect(lapsed.usageLimits?.windows).toEqual([]);
+        expect(lapsed.usageLimits?.unavailable?.reason).toBe("unsupported");
+        expect(lapsed.usageLimits?.unavailable?.message).toMatch(/^Kimi's sign-in expired at /);
+        expect(kimiRequests).toEqual([]);
+        // T3 never renews or rewrites Kimi's credentials.
+        expect(yield* fileSystem.readFileString(tokenPath)).toBe(expired);
+        expect(yield* fileSystem.readDirectory(path.dirname(tokenPath))).toEqual([
+          "kimi-code.json",
+        ]);
+      }),
   );
 
   it.effect("keeps options learned for each model across a refresh", () =>
