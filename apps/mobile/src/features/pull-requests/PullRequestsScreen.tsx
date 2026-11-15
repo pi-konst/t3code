@@ -100,6 +100,8 @@ export function PullRequestsScreen(
   const configs = useAtomValue(environmentServerConfigsAtom);
   const insets = useSafeAreaInsets();
   const contentTopInset = useContentTopInset();
+  const __m = useNativeColumnLayoutMetrics();
+  console.log("[PRJUMP] render", Date.now() % 100000, contentTopInset, __m?.safeArea.top, insets.top);
   // UIKit insets the list by its column's safe area, which this context can report as 0.
   const columnSafeBottom = useNativeColumnLayoutMetrics()?.safeArea.bottom;
   const bottomSafeArea =

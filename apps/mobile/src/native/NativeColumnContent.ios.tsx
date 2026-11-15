@@ -27,7 +27,7 @@ export function NativeColumnContent(props: {
         >
           {/* Observe the inset body. UIKit can reserve other columns in its safe area. */}
           <View style={{ flex: 1 }}>
-            <NativeLayoutObserver onChange={setMetrics} />
+            <NativeLayoutObserver onChange={(m) => { console.log("[PRJUMP] metrics", Date.now() % 100000, JSON.stringify({ w: m.width, h: m.height, sa: m.safeArea, e: m.verticalBarEdge, b: m.bottomBarInset })); setMetrics(m); }} />
             <NativeColumnLayoutMetricsContext value={metrics}>
               <HeaderHeightContext value={metrics?.safeArea.top ?? undefined}>
                 {props.children}
